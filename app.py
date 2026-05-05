@@ -341,8 +341,8 @@ def process_assabil(input_path, output_path):
 # SCRIPT 5: FERRERO — Accenture CR19 → GCOM
 # ==========================================
 
-# Accenture salesman code → GCOM vendor name
-# Input format: "AGAV001-JAMAL BICHLIFEN"  →  take name after "-"  →  look up below
+# Accenture salesman code → GCOM vendor name (Livreur)
+# Input format: "AGAV001-JAMAL BICHLIFEN" → extract name after "-" → look up below
 _VENDOR_NAME_MAP = {
     "JAMAL BICHLIFEN":   "BICHLIFIN JAMAL",
     "RACHID ALIAT":      "ALIAT RACHID",
@@ -359,22 +359,25 @@ def _resolve_vendor(raw: str) -> str:
     name_part = raw[dash + 1:].strip().upper() if dash >= 0 else raw.strip().upper()
     return _VENDOR_NAME_MAP.get(name_part, name_part)
 
-def _parse_accenture_date(raw) -> datetime:
-    """Parse Accenture YYYYMMDD integer/string → datetime."""
-    s = str(raw).strip()
-    if len(s) >= 8:
-        return datetime(int(s[:4]), int(s[4:6]), int(s[6:8]))
-    raise ValueError(f"Cannot parse date: {raw!r}")
+def _parse_mad(value) -> float:
+    """Parse Accenture MAD string (e.g. '1,166.40' or '324.00') to float."""
+    if value is None:
+        return 0.0
+    return float(str(value).replace(",", "").strip())
 
-def _convert_qty(qty: int, uom: str, bl_tu: int, bl_su: int, bl_cu: int) -> int:
+def _parse_pct(value) -> float:
+    """Parse discount percentage string '7.50%' → 7.5."""
+    if value is None:
+        return 0.0
+    return float(str(value).rstrip("%").strip())
+
+def _convert_qty(qty: int, uom: str, bl_tu: int, bl_su: int) -> int:
     """
     Convert Accenture quantity to GCOM units.
-    
-    Conversion rules (mirrors transformExcelController.ts):
-      TU  →  qty × bl_tu           (carton/transport unit → individual units)
-      SU  →  qty × bl_su           (secondary unit → individual units)
-                                    if bl_su == 0: no SU level exists, pass qty through
-      CU  →  qty                   (consumer unit = individual unit, no conversion)
+      TU  →  qty × bl_tu   (transport/carton unit → individual units)
+      SU  →  qty × bl_su   (secondary unit → individual units;
+                             if bl_su == 0 no SU level exists → pass through)
+      CU  →  qty            (consumer unit = individual unit, no conversion)
     """
     uom = uom.strip().upper()
     if uom == "TU":
@@ -383,15 +386,22 @@ def _convert_qty(qty: int, uom: str, bl_tu: int, bl_su: int, bl_cu: int) -> int:
         return qty * bl_su if bl_su > 0 else qty
     return qty  # CU
 
+def _sous_famille(hierarchy: str) -> str:
+    """'FA1500-RAFFAELLO'  →  'RAFFAELLO'"""
+    if not hierarchy:
+        return ""
+    parts = str(hierarchy).split("-", 1)
+    return parts[1].strip() if len(parts) > 1 else hierarchy.strip()
+
 def _load_ferrero_mapping(mapping_path: str) -> dict:
     """
-    Load Ferrero_GCOM_ACCENTURE.xlsx into a lookup dict:
-      { accenture_code_str → { gcom_code, name, bl_tu, bl_su, bl_cu } }
+    Load Ferrero_GCOM_ACCENTURE.xlsx into a lookup dict keyed by Accenture code:
+      { accenture_code → { gcom_code, name, bl_tu, bl_su, bl_cu } }
     """
     df = pd.read_excel(mapping_path, header=0)
     df.columns = ["name", "gcom_code", "accenture_code", "bl_tu", "bl_su", "bl_cu"]
     df["accenture_code"] = df["accenture_code"].astype(str).str.strip()
-    df["gcom_code"] = df["gcom_code"].astype(str).str.strip()
+    df["gcom_code"]      = df["gcom_code"].astype(str).str.strip()
 
     mapping = {}
     for _, row in df.iterrows():
@@ -411,19 +421,29 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
     Transform a Ferrero CR19 Document Listing Excel export from Accenture
     into a GCOM-ready import file.
 
-    Output workbook contains two sheets:
-      • "Livraisons par POS"  — 27-column GCOM format (resolved rows only)
-      • "Non Résolus"         — rows that could not be mapped, with reason
+    Target format (19 columns, matches Cleaned_Excel.xlsx exactly):
+      A  Secteur      B  Adresse      C  Ville        D  Livreur
+      E  Groupe       F  Famille      G  Sous Famille H  Code article
+      I  Article      J  Quantité     K  RTN          L  PU
+      M  Remise%      N  TX RSE       O  Remise MT    P  <
+      Q  Montant      R  Objectif     S  Secteur TRV
 
-    Returns { total, resolved, unresolved } for the UI summary.
+    Price conversions (all Accenture prices are HT → multiply by 1.2 for TTC):
+      PU        = Unit Price (MAD) × 1.2     (prix unitaire TTC, avant remise)
+      Remise%   = Discount %                  (already a percentage, kept as-is)
+      Remise MT = Discount Amt (MAD) × 1.2   (montant remise TTC)
+      Montant   = Net Price (MAD) × 1.2      (total TTC après remise)
+
+    Returns { total, resolved, unresolved }.
     """
-    # ── 1. Load the Accenture→GCOM article mapping ─────────────────────
+    TVA = 1.20  # Ferrero products: 20% VAT
+
+    # ── 1. Load the Accenture → GCOM article mapping ───────────────────
     mapping = _load_ferrero_mapping(mapping_path)
 
-    # ── 2. Parse the Accenture Excel — locate header row dynamically ───
-    #    CR19 format: rows 1-11 are report metadata, row 12 is the column
-    #    header. We scan for the row containing "Product Code" so the code
-    #    is resilient to Accenture changing the number of metadata rows.
+    # ── 2. Parse the CR19 Excel — locate header row dynamically ────────
+    #    Rows 1-11 are Accenture report metadata; row 12 is the real header.
+    #    We scan for "Product Code" so the code survives format changes.
     wb_in = load_workbook(input_path, read_only=True, data_only=True)
     ws_in = wb_in.active
 
@@ -440,15 +460,16 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
         wb_in.close()
         raise ValueError('Format invalide — colonne "Product Code" introuvable.')
 
-    # Build column-name → 0-based-index map from the header row
     header_vals = list(
         ws_in.iter_rows(min_row=header_row_idx, max_row=header_row_idx, values_only=True)
     )[0]
     col_map = {str(v).strip(): i for i, v in enumerate(header_vals) if v is not None}
 
     required_cols = [
-        "Customer Code", "Customer Name", "Transaction No.",
-        "Product Code", "Transaction Date", "Qty", "UOM", "Salesman",
+        "Product Code", "Qty", "UOM", "Salesman",
+        "Transaction No.", "Transaction Date",
+        "Product Hierarchy Level 4",
+        "Unit Price (MAD)", "Net Price(MAD)", "Discount Amt (MAD)", "Discount %",
     ]
     for col in required_cols:
         if col not in col_map:
@@ -460,9 +481,8 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
     raw_rows = []
 
     for row_vals in ws_in.iter_rows(min_row=header_row_idx + 1, values_only=True):
-        # Skip rows that are too short (empty/summary rows at end of file)
         if len(row_vals) <= max_col_needed:
-            continue
+            continue  # skip short/empty trailing rows
 
         product_code = str(row_vals[col_map["Product Code"]] or "").strip()
         qty_raw      = row_vals[col_map["Qty"]]
@@ -477,14 +497,17 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
             continue
 
         raw_rows.append({
-            "customer_code":    str(row_vals[col_map["Customer Code"]]   or "").strip(),
-            "customer_name":    str(row_vals[col_map["Customer Name"]]   or "").strip(),
-            "transaction_no":   str(row_vals[col_map["Transaction No."]] or "").strip(),
             "product_code":     product_code,
-            "transaction_date": row_vals[col_map["Transaction Date"]],
             "qty":              qty,
             "uom":              uom,
-            "salesman":         str(row_vals[col_map["Salesman"]] or "").strip(),
+            "salesman":         str(row_vals[col_map["Salesman"]]                    or "").strip(),
+            "transaction_no":   str(row_vals[col_map["Transaction No."]]             or "").strip(),
+            "transaction_date": row_vals[col_map["Transaction Date"]],
+            "hierarchy":        str(row_vals[col_map["Product Hierarchy Level 4"]]   or "").strip(),
+            "unit_price_ht":    _parse_mad(row_vals[col_map["Unit Price (MAD)"]]),
+            "net_price_ht":     _parse_mad(row_vals[col_map["Net Price(MAD)"]]),
+            "discount_amt_ht":  _parse_mad(row_vals[col_map["Discount Amt (MAD)"]]),
+            "discount_pct":     _parse_pct(row_vals[col_map["Discount %"]]),
         })
 
     wb_in.close()
@@ -492,7 +515,7 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
     if not raw_rows:
         raise ValueError("Aucune ligne de données trouvée dans le fichier.")
 
-    # ── 4. Map each row to GCOM format ─────────────────────────────────
+    # ── 4. Transform each row ───────────────────────────────────────────
     gcom_rows  = []
     unresolved = []
 
@@ -507,78 +530,118 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
             unresolved.append({**row, "reason": "conversion_not_configured"})
             continue
 
-        gcom_qty = _convert_qty(row["qty"], row["uom"], art["bl_tu"], art["bl_su"], art["bl_cu"])
+        gcom_qty = _convert_qty(row["qty"], row["uom"], art["bl_tu"], art["bl_su"])
 
-        try:
-            date = _parse_accenture_date(row["transaction_date"])
-        except Exception:
-            date = None
+        # All prices: HT → TTC (× 1.20)
+        pu_ttc        = round(row["unit_price_ht"]   * TVA, 2)
+        montant_ttc   = round(row["net_price_ht"]    * TVA, 2)
+        remise_mt_ttc = round(row["discount_amt_ht"] * TVA, 2)
+        remise_pct    = round(row["discount_pct"], 2)
+
+        livreur = _resolve_vendor(row["salesman"])
 
         gcom_rows.append({
-            "produit":    art["gcom_code"],
-            "date":       date,
-            "bl":         row["transaction_no"],
-            "client":     row["customer_code"],
-            "nom_client": row["customer_name"],
-            "qte":        gcom_qty,
-            "vendor":     _resolve_vendor(row["salesman"]),
+            # Location / routing fields (static for Agadir agency)
+            "secteur":      "agadir detail",
+            "adresse":      "centre bigra",
+            "ville":        "Agadir",
+            "livreur":      livreur,
+            # Product classification
+            "groupe":       "FERRERO",
+            "famille":      "FERRERO",
+            "sous_famille": _sous_famille(row["hierarchy"]),
+            # Article
+            "code_article": art["gcom_code"],
+            "article":      art["name"],
+            # Quantities
+            "quantite":     gcom_qty,
+            "rtn":          0,
+            # Prices (TTC)
+            "pu":           pu_ttc,
+            "remise_pct":   remise_pct,
+            "tx_rse":       0,
+            "remise_mt":    remise_mt_ttc,
+            "col_lt":       0,          # "<" separator column — always 0
+            "montant":      montant_ttc,
+            "objectif":     0,
+            "secteur_trv":  "",
         })
 
     # ── 5. Build output workbook ────────────────────────────────────────
     wb_out = Workbook()
 
-    # ── Sheet 1: "Livraisons par POS" — 27-column GCOM import format ───
-    #    Column layout (0-based index, matches GCOM Livraisons_par_POS exactly):
-    #      [0]  Produit    [1]  V        [2]  Date       [3]  BL
-    #      [4]  Cd VD      [5]  V        [6]  Client     [7]  Nom Client
-    #      [8]  Qte Carton [9]  v        [10] QTE        [11] Remise
-    #      [12–23] V×12 (empty separator columns)
-    #      [24] Secteur    [25] Livreur  [26] TIMBRE
-    ws_gcom = wb_out.active
-    ws_gcom.title = "Livraisons par POS"
+    # ── Sheet 1: GCOM import data — 19 columns ─────────────────────────
+    #   Matches Cleaned_Excel.xlsx exactly:
+    #   A Secteur | B Adresse | C Ville | D Livreur | E Groupe | F Famille |
+    #   G Sous Famille | H Code article | I Article | J Quantité | K RTN |
+    #   L PU | M Remise% | N TX RSE | O Remise MT | P < | Q Montant |
+    #   R Objectif | S Secteur TRV
+    ws_out = wb_out.active
+    ws_out.title = "GCOM Import"
 
-    GCOM_HEADERS = [
-        "Produit", "V", "Date", "BL", "Cd VD", "V",
-        "Client", "Nom Client", "Qte Carton", "v", "QTE", "Remise",
-        "V", "V", "V", "V", "V", "V", "V", "V", "V", "V", "V", "V",
-        "Secteur", "Livreur", "TIMBRE",
+    HEADERS = [
+        "Secteur", "Adresse", "Ville", "Livreur",
+        "Groupe", "Famille", "Sous Famille",
+        "Code article", "Article",
+        "Quantité", "RTN",
+        "PU", "Remise%", "TX RSE", "Remise MT", "<",
+        "Montant", "Objectif", "Secteur TRV",
     ]
-    ws_gcom.append(GCOM_HEADERS)
+    ws_out.append(HEADERS)
 
     header_fill = PatternFill("solid", fgColor="D9E1F2")
-    for cell in ws_gcom[1]:
+    for cell in ws_out[1]:
         cell.fill      = header_fill
         cell.font      = Font(bold=True)
         cell.alignment = Alignment(horizontal="center")
 
+    num_fmt_price = '#,##0.00'
     for r in gcom_rows:
-        out_row = [None] * 27
-        out_row[0]  = r["produit"]      # A  Produit
-        out_row[2]  = r["date"]         # C  Date
-        out_row[3]  = r["bl"]           # D  BL
-        out_row[6]  = r["client"]       # G  Client
-        out_row[7]  = r["nom_client"]   # H  Nom Client
-        out_row[8]  = 0                 # I  Qte Carton
-        out_row[10] = r["qte"]          # K  QTE
-        out_row[11] = 0                 # L  Remise
-        out_row[24] = r["vendor"]       # Y  Secteur
-        out_row[25] = r["vendor"]       # Z  Livreur
-        out_row[26] = 0                 # AA TIMBRE
-        ws_gcom.append(out_row)
-        ws_gcom.cell(row=ws_gcom.max_row, column=3).number_format = "DD/MM/YYYY"
+        ws_out.append([
+            r["secteur"],       # A
+            r["adresse"],       # B
+            r["ville"],         # C
+            r["livreur"],       # D
+            r["groupe"],        # E
+            r["famille"],       # F
+            r["sous_famille"],  # G
+            r["code_article"],  # H
+            r["article"],       # I
+            r["quantite"],      # J
+            r["rtn"],           # K
+            r["pu"],            # L
+            r["remise_pct"],    # M
+            r["tx_rse"],        # N
+            r["remise_mt"],     # O
+            r["col_lt"],        # P  (<)
+            r["montant"],       # Q
+            r["objectif"],      # R
+            r["secteur_trv"],   # S
+        ])
+        data_row = ws_out.max_row
+        for col_letter in ("L", "O", "Q"):  # PU, Remise MT, Montant
+            ws_out[f"{col_letter}{data_row}"].number_format = num_fmt_price
 
-    ws_gcom.column_dimensions["A"].width = 16
-    ws_gcom.column_dimensions["C"].width = 12
-    ws_gcom.column_dimensions["D"].width = 14
-    ws_gcom.column_dimensions["G"].width = 14
-    ws_gcom.column_dimensions["H"].width = 32
-    ws_gcom.column_dimensions["K"].width = 10
+    # Column widths
+    col_widths = {
+        "A": 16, "B": 16, "C": 12, "D": 22,
+        "E": 10, "F": 10, "G": 22,
+        "H": 16, "I": 30,
+        "J": 10, "K": 8,
+        "L": 12, "M": 10, "N": 8, "O": 12, "P": 4,
+        "Q": 14, "R": 10, "S": 14,
+    }
+    for col_letter, width in col_widths.items():
+        ws_out.column_dimensions[col_letter].width = width
 
-    # ── Sheet 2: "Non Résolus" — rows that couldn't be mapped ──────────
+    ws_out.auto_filter.ref = ws_out.dimensions
+
+    # ── Sheet 2: Non Résolus ────────────────────────────────────────────
     if unresolved:
         ws_ur = wb_out.create_sheet(title="Non Résolus")
-        ws_ur.append(["Code Accenture", "Client", "Nom Client", "BL", "Qté", "Unité", "Raison"])
-
+        ws_ur.append([
+            "Code Accenture", "Hiérarchie", "BL", "Qté", "Unité", "Raison"
+        ])
         ur_fill = PatternFill("solid", fgColor="FDEBD0")
         for cell in ws_ur[1]:
             cell.fill      = ur_fill
@@ -592,14 +655,12 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
         for u in unresolved:
             ws_ur.append([
                 u["product_code"],
-                u["customer_code"],
-                u["customer_name"],
+                u.get("hierarchy", ""),
                 u["transaction_no"],
                 u["qty"],
                 u["uom"],
                 reason_labels.get(u["reason"], u["reason"]),
             ])
-
         for col in ws_ur.columns:
             max_len = max(len(str(c.value or "")) for c in col)
             ws_ur.column_dimensions[col[0].column_letter].width = min(max_len + 2, 40)
