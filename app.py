@@ -850,6 +850,8 @@ else:
     else:
         allowed_types = ["xls", "xlsx"]
 
+    uploaded_file = st.file_uploader(f"Uploadez le fichier pour : {tool}", type=allowed_types)
+
     if uploaded_file is not None:
         st.info("Fichier chargé. Cliquez sur le bouton pour lancer le traitement.")
 
