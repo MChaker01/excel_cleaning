@@ -421,29 +421,30 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
     Transform a Ferrero CR19 Document Listing Excel export from Accenture
     into a GCOM-ready import file.
 
-    Target format (19 columns, matches Cleaned_Excel.xlsx exactly):
-      A  Secteur      B  Adresse      C  Ville        D  Livreur
-      E  Groupe       F  Famille      G  Sous Famille H  Code article
-      I  Article      J  Quantité     K  RTN          L  PU
-      M  Remise%      N  TX RSE       O  Remise MT    P  <
-      Q  Montant      R  Objectif     S  Secteur TRV
+    Target format — 29 columns (matches Cleaned_Excel.xlsx exactly):
+      A  Genre          B  Agence         C  Date           D  N°BL / N°FA
+      E  N°BC / N°RC   F  N°FC           G  Code vendeur   H  Vendeur
+      I  code Client   J  Client         K  Type Client    L  Secteur
+      M  Adresse       N  Ville          O  Livreur        P  Groupe
+      Q  Famille       R  Sous Famille   S  Code article   T  Article
+      U  Quantité      V  RTN            W  PU             X  Remise%
+      Y  TX RSE        Z  Remise MT      AA <              AB Montant
+      AC Objectif
 
-    Price conversions (all Accenture prices are HT → multiply by 1.2 for TTC):
-      PU        = Unit Price (MAD) × 1.2     (prix unitaire TTC, avant remise)
-      Remise%   = Discount %                  (already a percentage, kept as-is)
-      Remise MT = Discount Amt (MAD) × 1.2   (montant remise TTC)
-      Montant   = Net Price (MAD) × 1.2      (total TTC après remise)
+    Price conversions (Accenture prices are HT → ×1.20 for TTC):
+      PU        = Unit Price (MAD) × 1.2
+      Remise%   = Discount %  (kept as-is)
+      Remise MT = Discount Amt (MAD) × 1.2
+      Montant   = Net Price (MAD) × 1.2
 
     Returns { total, resolved, unresolved }.
     """
-    TVA = 1.20  # Ferrero products: 20% VAT
+    TVA = 1.20  # Ferrero: 20% VAT
 
     # ── 1. Load the Accenture → GCOM article mapping ───────────────────
     mapping = _load_ferrero_mapping(mapping_path)
 
     # ── 2. Parse the CR19 Excel — locate header row dynamically ────────
-    #    Rows 1-11 are Accenture report metadata; row 12 is the real header.
-    #    We scan for "Product Code" so the code survives format changes.
     wb_in = load_workbook(input_path, read_only=True, data_only=True)
     ws_in = wb_in.active
 
@@ -468,6 +469,7 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
     required_cols = [
         "Product Code", "Qty", "UOM", "Salesman",
         "Transaction No.", "Transaction Date",
+        "Customer Code", "Customer Name",
         "Product Hierarchy Level 4",
         "Unit Price (MAD)", "Net Price(MAD)", "Discount Amt (MAD)", "Discount %",
     ]
@@ -496,18 +498,29 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
         except (ValueError, TypeError):
             continue
 
+        # Parse transaction date → DD/MM/YY string for GCOM
+        raw_date = row_vals[col_map["Transaction Date"]]
+        try:
+            s = str(raw_date).strip()
+            d = datetime(int(s[:4]), int(s[4:6]), int(s[6:8]))
+            date_str = d.strftime("%d/%m/%y")
+        except Exception:
+            date_str = str(raw_date or "").strip()
+
         raw_rows.append({
-            "product_code":     product_code,
-            "qty":              qty,
-            "uom":              uom,
-            "salesman":         str(row_vals[col_map["Salesman"]]                    or "").strip(),
-            "transaction_no":   str(row_vals[col_map["Transaction No."]]             or "").strip(),
-            "transaction_date": row_vals[col_map["Transaction Date"]],
-            "hierarchy":        str(row_vals[col_map["Product Hierarchy Level 4"]]   or "").strip(),
-            "unit_price_ht":    _parse_mad(row_vals[col_map["Unit Price (MAD)"]]),
-            "net_price_ht":     _parse_mad(row_vals[col_map["Net Price(MAD)"]]),
-            "discount_amt_ht":  _parse_mad(row_vals[col_map["Discount Amt (MAD)"]]),
-            "discount_pct":     _parse_pct(row_vals[col_map["Discount %"]]),
+            "product_code":    product_code,
+            "qty":             qty,
+            "uom":             uom,
+            "salesman":        str(row_vals[col_map["Salesman"]]                  or "").strip(),
+            "transaction_no":  str(row_vals[col_map["Transaction No."]]           or "").strip(),
+            "date_str":        date_str,
+            "customer_code":   str(row_vals[col_map["Customer Code"]]             or "").strip(),
+            "customer_name":   str(row_vals[col_map["Customer Name"]]             or "").strip(),
+            "hierarchy":       str(row_vals[col_map["Product Hierarchy Level 4"]] or "").strip(),
+            "unit_price_ht":   _parse_mad(row_vals[col_map["Unit Price (MAD)"]]),
+            "net_price_ht":    _parse_mad(row_vals[col_map["Net Price(MAD)"]]),
+            "discount_amt_ht": _parse_mad(row_vals[col_map["Discount Amt (MAD)"]]),
+            "discount_pct":    _parse_pct(row_vals[col_map["Discount %"]]),
         })
 
     wb_in.close()
@@ -530,62 +543,61 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
             unresolved.append({**row, "reason": "conversion_not_configured"})
             continue
 
-        gcom_qty = _convert_qty(row["qty"], row["uom"], art["bl_tu"], art["bl_su"])
-
-        # All prices: HT → TTC (× 1.20)
+        gcom_qty      = _convert_qty(row["qty"], row["uom"], art["bl_tu"], art["bl_su"])
         pu_ttc        = round(row["unit_price_ht"]   * TVA, 2)
         montant_ttc   = round(row["net_price_ht"]    * TVA, 2)
         remise_mt_ttc = round(row["discount_amt_ht"] * TVA, 2)
         remise_pct    = round(row["discount_pct"], 2)
-
-        livreur = _resolve_vendor(row["salesman"])
+        livreur       = _resolve_vendor(row["salesman"])
 
         gcom_rows.append({
-            # Location / routing fields (static for Agadir agency)
-            "secteur":      "agadir detail",
-            "adresse":      "centre bigra",
-            "ville":        "Agadir",
-            "livreur":      livreur,
-            # Product classification
-            "groupe":       "FERRERO",
-            "famille":      "FERRERO",
-            "sous_famille": _sous_famille(row["hierarchy"]),
-            # Article
-            "code_article": art["gcom_code"],
-            "article":      art["name"],
-            # Quantities
-            "quantite":     gcom_qty,
-            "rtn":          0,
-            # Prices (TTC)
-            "pu":           pu_ttc,
-            "remise_pct":   remise_pct,
-            "tx_rse":       0,
-            "remise_mt":    remise_mt_ttc,
-            "col_lt":       0,          # "<" separator column — always 0
-            "montant":      montant_ttc,
-            "objectif":     0,
-            "secteur_trv":  "",
+            "genre":         "CONV",
+            "agence":        "Agence Agadir",
+            "date":          row["date_str"],
+            "nbl_nfa":       row["transaction_no"] + " / FA",
+            "nbc_nrc":       "3900",
+            "nfc":           "",
+            "code_vendeur":  "",
+            "vendeur":       livreur,
+            "code_client":   row["customer_code"],
+            "client":        row["customer_name"],
+            "type_client":   "Détail",
+            "secteur":       "agadir detail",
+            "adresse":       "centre bigra",
+            "ville":         "Agadir",
+            "livreur":       livreur,
+            "groupe":        "FERRERO",
+            "famille":       "FERRERO",
+            "sous_famille":  _sous_famille(row["hierarchy"]),
+            "code_article":  art["gcom_code"],
+            "article":       art["name"],
+            "quantite":      gcom_qty,
+            "rtn":           0,
+            "pu":            pu_ttc,
+            "remise_pct":    remise_pct,
+            "tx_rse":        0,
+            "remise_mt":     remise_mt_ttc,
+            "col_lt":        0,
+            "montant":       montant_ttc,
+            "objectif":      0,
         })
 
     # ── 5. Build output workbook ────────────────────────────────────────
     wb_out = Workbook()
-
-    # ── Sheet 1: GCOM import data — 19 columns ─────────────────────────
-    #   Matches Cleaned_Excel.xlsx exactly:
-    #   A Secteur | B Adresse | C Ville | D Livreur | E Groupe | F Famille |
-    #   G Sous Famille | H Code article | I Article | J Quantité | K RTN |
-    #   L PU | M Remise% | N TX RSE | O Remise MT | P < | Q Montant |
-    #   R Objectif | S Secteur TRV
     ws_out = wb_out.active
     ws_out.title = "GCOM Import"
 
+    # 29 columns — exact match to Cleaned_Excel.xlsx
     HEADERS = [
+        "Genre", "Agence", "Date ", "N°BL / N°FA",
+        "N°BC  / N°RC", "N°FC ", "Code vendeur", "Vendeur",
+        "code Client ", "Client", "Type Client",
         "Secteur", "Adresse", "Ville", "Livreur",
         "Groupe", "Famille", "Sous Famille",
         "Code article", "Article",
         "Quantité", "RTN",
         "PU", "Remise%", "TX RSE", "Remise MT", "<",
-        "Montant", "Objectif", "Secteur TRV",
+        "Montant", "Objectif",
     ]
     ws_out.append(HEADERS)
 
@@ -595,41 +607,54 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
         cell.font      = Font(bold=True)
         cell.alignment = Alignment(horizontal="center")
 
-    num_fmt_price = '#,##0.00'
+    num_fmt = '#,##0.00'
     for r in gcom_rows:
         ws_out.append([
-            r["secteur"],       # A
-            r["adresse"],       # B
-            r["ville"],         # C
-            r["livreur"],       # D
-            r["groupe"],        # E
-            r["famille"],       # F
-            r["sous_famille"],  # G
-            r["code_article"],  # H
-            r["article"],       # I
-            r["quantite"],      # J
-            r["rtn"],           # K
-            r["pu"],            # L
-            r["remise_pct"],    # M
-            r["tx_rse"],        # N
-            r["remise_mt"],     # O
-            r["col_lt"],        # P  (<)
-            r["montant"],       # Q
-            r["objectif"],      # R
-            r["secteur_trv"],   # S
+            r["genre"],        # A
+            r["agence"],       # B
+            r["date"],         # C
+            r["nbl_nfa"],      # D
+            r["nbc_nrc"],      # E
+            r["nfc"],          # F
+            r["code_vendeur"], # G
+            r["vendeur"],      # H
+            r["code_client"],  # I
+            r["client"],       # J
+            r["type_client"],  # K
+            r["secteur"],      # L
+            r["adresse"],      # M
+            r["ville"],        # N
+            r["livreur"],      # O
+            r["groupe"],       # P
+            r["famille"],      # Q
+            r["sous_famille"], # R
+            r["code_article"], # S
+            r["article"],      # T
+            r["quantite"],     # U
+            r["rtn"],          # V
+            r["pu"],           # W
+            r["remise_pct"],   # X
+            r["tx_rse"],       # Y
+            r["remise_mt"],    # Z
+            r["col_lt"],       # AA
+            r["montant"],      # AB
+            r["objectif"],     # AC
         ])
-        data_row = ws_out.max_row
-        for col_letter in ("L", "O", "Q"):  # PU, Remise MT, Montant
-            ws_out[f"{col_letter}{data_row}"].number_format = num_fmt_price
+        dr = ws_out.max_row
+        for col_letter in ("W", "Z", "AB"):  # PU, Remise MT, Montant
+            ws_out[f"{col_letter}{dr}"].number_format = num_fmt
 
     # Column widths
     col_widths = {
-        "A": 16, "B": 16, "C": 12, "D": 22,
-        "E": 10, "F": 10, "G": 22,
-        "H": 16, "I": 30,
-        "J": 10, "K": 8,
-        "L": 12, "M": 10, "N": 8, "O": 12, "P": 4,
-        "Q": 14, "R": 10, "S": 14,
+        "A": 8,  "B": 16, "C": 10, "D": 18,
+        "E": 14, "F": 10, "G": 14, "H": 22,
+        "I": 14, "J": 28, "K": 12,
+        "L": 16, "M": 16, "N": 12, "O": 22,
+        "P": 10, "Q": 10, "R": 24,
+        "S": 16, "T": 30,
+        "U": 10, "V": 8,
+        "W": 12, "X": 10, "Y": 8, "Z": 12, "AA": 4,
+        "AB": 14, "AC": 10,
     }
     for col_letter, width in col_widths.items():
         ws_out.column_dimensions[col_letter].width = width
@@ -639,9 +664,8 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
     # ── Sheet 2: Non Résolus ────────────────────────────────────────────
     if unresolved:
         ws_ur = wb_out.create_sheet(title="Non Résolus")
-        ws_ur.append([
-            "Code Accenture", "Hiérarchie", "BL", "Qté", "Unité", "Raison"
-        ])
+        ws_ur.append(["Code Accenture", "Hiérarchie", "BL", "Client", "Qté", "Unité", "Raison"])
+
         ur_fill = PatternFill("solid", fgColor="FDEBD0")
         for cell in ws_ur[1]:
             cell.fill      = ur_fill
@@ -657,6 +681,7 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
                 u["product_code"],
                 u.get("hierarchy", ""),
                 u["transaction_no"],
+                u.get("customer_name", ""),
                 u["qty"],
                 u["uom"],
                 reason_labels.get(u["reason"], u["reason"]),
