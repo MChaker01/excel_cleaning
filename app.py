@@ -700,6 +700,61 @@ def process_ferrero_accenture(input_path: str, output_path: str, mapping_path: s
 
 
 # ==========================================
+# SCRIPT 6: CR22 PROMO MONITOR CLEANING
+# ==========================================
+def process_cr22(input_path, output_path):
+    workbook = load_workbook(input_path)
+    sheet = workbook.active
+
+    sheet._images = []
+
+    # ── 1. Unmerge all cells ───────────────────────────────────────────
+    for merged_range in list(sheet.merged_cells.ranges):
+        sheet.unmerge_cells(str(merged_range))
+
+    # ── 2. Delete header metadata rows 1–11 (title + Date From/To etc.)
+    #    Row 12 is the real column header — delete rows 1 to 11
+    sheet.delete_rows(1, 11)
+
+    # ── 3. Delete "Total By Salesman" and grand "Total" summary rows
+    for row in range(sheet.max_row, 1, -1):
+        l_val = str(sheet.cell(row=row, column=12).value or "").strip()
+        if l_val in ("Total By Salesman", "Total"):
+            sheet.delete_rows(row)
+
+    # ── 4. Delete fully blank rows left after unmerging
+    for row in range(sheet.max_row, 1, -1):
+        if all(sheet.cell(row=row, column=c).value in (None, "")
+               for c in range(1, sheet.max_column + 1)):
+            sheet.delete_rows(row)
+
+    # ── 5. Delete empty columns (ghost columns created by unmerging)
+    for col in range(sheet.max_column, 0, -1):
+        is_empty = all(
+            sheet.cell(row=r, column=col).value in (None, "")
+            for r in range(1, sheet.max_row + 1)
+        )
+        if is_empty:
+            sheet.delete_cols(col)
+
+    # ── 6. Fix header names for the two sub-columns that had None after unmerge
+    #    Col B = Promotion Description (was merged under "Promotion")
+    #    Col G = Distributor Name       (was merged under "Distributor")
+    if sheet.cell(row=1, column=2).value is None:
+        sheet.cell(row=1, column=2).value = "Promotion Description"
+    if sheet.cell(row=1, column=7).value is None:
+        sheet.cell(row=1, column=7).value = "Distributor Name"
+    if sheet.cell(row=1, column=9).value is None:
+        sheet.cell(row=1, column=9).value = "Salesman Name"
+
+    # ── 7. Auto-width columns ──────────────────────────────────────────
+    for col_cells in sheet.columns:
+        max_len = max((len(str(c.value)) for c in col_cells if c.value), default=0)
+        sheet.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 40)
+
+    workbook.save(output_path)
+
+# ==========================================
 # STREAMLIT UI DASHBOARD
 # ==========================================
 st.set_page_config(page_title="ZiarStock Data Cleaner", layout="centered", page_icon="🧹")
@@ -714,6 +769,7 @@ tool = st.sidebar.radio("Sélectionnez l'outil :", [
     "3. Nettoyage Encour-RD",
     "4. Nettoyage Assabil",
     "5. Ferrero — Accenture CR19 → GCOM",
+    "6. Nettoyage CR22 Promo Monitor",
 ])
 
 # ── Tool 5 has a different layout (two uploads) ──────────────────────────────
@@ -794,8 +850,6 @@ else:
     else:
         allowed_types = ["xls", "xlsx"]
 
-    uploaded_file = st.file_uploader(f"Uploadez le fichier pour : {tool}", type=allowed_types)
-
     if uploaded_file is not None:
         st.info("Fichier chargé. Cliquez sur le bouton pour lancer le traitement.")
 
@@ -819,6 +873,8 @@ else:
                         process_encour(input_path, output_path, file_ext)
                     elif "Assabil" in tool:
                         process_assabil(input_path, output_path)
+                    elif "CR22" in tool:
+                        process_cr22(input_path, output_path)
 
                     with open(output_path, "rb") as f:
                         processed_data = f.read()
