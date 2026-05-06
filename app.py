@@ -712,8 +712,7 @@ def process_cr22(input_path, output_path):
     for merged_range in list(sheet.merged_cells.ranges):
         sheet.unmerge_cells(str(merged_range))
 
-    # ── 2. Delete header metadata rows 1–11 (title + Date From/To etc.)
-    #    Row 12 is the real column header — delete rows 1 to 11
+    # ── 2. Delete header metadata rows 1-11 (title + Date From/To etc.)
     sheet.delete_rows(1, 11)
 
     # ── 3. Delete "Total By Salesman" and grand "Total" summary rows
@@ -737,9 +736,7 @@ def process_cr22(input_path, output_path):
         if is_empty:
             sheet.delete_cols(col)
 
-    # ── 6. Fix header names for the two sub-columns that had None after unmerge
-    #    Col B = Promotion Description (was merged under "Promotion")
-    #    Col G = Distributor Name       (was merged under "Distributor")
+    # ── 6. Fix header names for sub-columns that had None after unmerge
     if sheet.cell(row=1, column=2).value is None:
         sheet.cell(row=1, column=2).value = "Promotion Description"
     if sheet.cell(row=1, column=7).value is None:
@@ -747,7 +744,47 @@ def process_cr22(input_path, output_path):
     if sheet.cell(row=1, column=9).value is None:
         sheet.cell(row=1, column=9).value = "Salesman Name"
 
-    # ── 7. Auto-width columns ──────────────────────────────────────────
+    # ── 7. Delete "Distributor Name" column (find by header)
+    dist_name_col = None
+    for c in range(1, sheet.max_column + 1):
+        if sheet.cell(row=1, column=c).value == "Distributor Name":
+            dist_name_col = c
+            break
+    if dist_name_col:
+        sheet.delete_cols(dist_name_col)
+
+    # ── 8. Fill down empty cells in promo-level columns
+    #    Columns: Promotion(1), Promo Description(2), Promo Type(3),
+    #             Start Date(4), End Date(5), Distributor(6)
+    for col in [1, 2, 3, 4, 5, 6]:
+        last_val = None
+        for row in range(2, sheet.max_row + 1):
+            val = sheet.cell(row=row, column=col).value
+            if val not in (None, ""):
+                last_val = val
+            elif last_val is not None:
+                sheet.cell(row=row, column=col).value = last_val
+
+    # ── 9. Convert MAD columns HT -> TTC (x 1.20)
+    TVA = 1.20
+    mad_cols = []
+    for c in range(1, sheet.max_column + 1):
+        header = str(sheet.cell(row=1, column=c).value or "")
+        if "(MAD)" in header:
+            mad_cols.append(c)
+
+    for col in mad_cols:
+        for row in range(2, sheet.max_row + 1):
+            cell = sheet.cell(row=row, column=col)
+            if cell.value not in (None, ""):
+                try:
+                    numeric = float(str(cell.value).replace(",", "").strip())
+                    cell.value = round(numeric * TVA, 2)
+                    cell.number_format = "#,##0.00"
+                except (ValueError, TypeError):
+                    pass
+
+    # ── 10. Auto-width columns ─────────────────────────────────────────
     for col_cells in sheet.columns:
         max_len = max((len(str(c.value)) for c in col_cells if c.value), default=0)
         sheet.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 40)
